@@ -1,7 +1,9 @@
 import os
 import asyncio
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
@@ -10,25 +12,30 @@ load_dotenv()
 
 app = FastAPI()
 
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-class CORSManualMiddleware(BaseHTTPMiddleware):
+class CORSMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin", "*")
+
+        # Preflight isteği
         if request.method == "OPTIONS":
-            response = JSONResponse({})
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "*"
+            response = JSONResponse(content={}, status_code=200)
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Max-Age"] = "600"
             return response
+
         response = await call_next(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
 
-app.add_middleware(CORSManualMiddleware)
+app.add_middleware(CORSMiddleware)
 
 # Store credentials from .env
 STORES = {}
@@ -58,7 +65,6 @@ async def login(page, username, password):
     await page.fill('[data-testid="password"]', password)
     await page.keyboard.press("Enter")
     await page.wait_for_load_state("networkidle")
-    # Close popup if present
     try:
         popup = page.locator('[data-testid="quality-control-overlay-button"]')
         if await popup.is_visible(timeout=5000):
@@ -89,7 +95,6 @@ async def get_tab_counts(page):
 
 
 async def scroll_and_collect_rows(page):
-    """Scroll the orders table to load all rows"""
     table = page.locator('[data-testid="orders-table"]')
     prev_count = 0
     while True:
@@ -107,25 +112,19 @@ async def scroll_and_collect_rows(page):
 
 
 async def scrape_order_detail(page):
-    """Extract detail from an open order detail panel"""
     await page.wait_for_timeout(800)
     order = {}
 
-    # Order number
     try:
-        order["order_number"] = await page.locator('[data-testid="order-detail-number"]').text_content()
-        order["order_number"] = order["order_number"].strip()
+        order["order_number"] = (await page.locator('[data-testid="order-detail-number"]').text_content() or "").strip()
     except:
         order["order_number"] = ""
 
-    # Status
     try:
-        order["status"] = await page.locator('[data-testid="order-status-badge"]').text_content()
-        order["status"] = order["status"].strip()
+        order["status"] = (await page.locator('[data-testid="order-status-badge"]').text_content() or "").strip()
     except:
         order["status"] = ""
 
-    # Kuryer geliş
     try:
         hints = page.locator('.tw\\:text-umico-text-hint')
         count = await hints.count()
@@ -139,7 +138,6 @@ async def scrape_order_detail(page):
     except:
         order["courier_arrival"] = ""
 
-    # Boxes / Qutular
     boxes = []
     try:
         box_els = page.locator('.tw\\:ring-1.tw\\:ring-umico-stroke-strokes-second')
@@ -148,33 +146,28 @@ async def scrape_order_detail(page):
             box = box_els.nth(i)
             box_data = {}
 
-            # Box title
             try:
                 box_data["box_title"] = (await box.locator('.tw\\:text-lg').text_content() or "").strip()
             except:
                 box_data["box_title"] = f"Qutu #{i+1}"
 
-            # Logistika nömrəsi
             try:
                 logistic_els = box.locator('.tw\\:text-\\[15px\\].tw\\:leading-\\[23px\\].tw\\:flex')
                 box_data["logistics_number"] = (await logistic_els.text_content() or "").replace("Loqistika nömrəsi:", "").strip()
             except:
                 box_data["logistics_number"] = ""
 
-            # Image
             try:
                 img = box.locator('img').first
                 box_data["image"] = await img.get_attribute("src") or ""
             except:
                 box_data["image"] = ""
 
-            # Product name
             try:
                 box_data["product_name"] = (await box.locator('p').first.text_content() or "").strip()
             except:
                 box_data["product_name"] = ""
 
-            # Miqdar & Qiymət
             try:
                 hint_divs = box.locator('.tw\\:text-umico-text-hint')
                 h_count = await hint_divs.count()
@@ -206,12 +199,6 @@ def get_stores():
     return {"stores": list(STORES.keys())}
 
 
-@app.post("/counts")
-async def get_counts(req: BaseModel):
-    # Just return store list for counts endpoint
-    pass
-
-
 @app.post("/scrape/counts")
 async def scrape_counts(body: dict):
     store_name = body.get("store_name")
@@ -224,7 +211,6 @@ async def scrape_counts(body: dict):
         page = await browser.new_page()
         try:
             await login(page, creds["username"], creds["password"])
-            # Navigate to orders page to get counts
             await page.goto("https://business.umico.az/account/orders?state=new", wait_until="networkidle")
             await page.wait_for_timeout(2000)
             counts = await get_tab_counts(page)
@@ -260,7 +246,6 @@ async def scrape_orders(req: ScrapeRequest):
                     await page.wait_for_timeout(1000)
                     detail = await scrape_order_detail(page)
                     orders.append(detail)
-                    # Close detail panel - press Escape or click back
                     await page.keyboard.press("Escape")
                     await page.wait_for_timeout(500)
                 except Exception as e:
